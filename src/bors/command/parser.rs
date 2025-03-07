@@ -8,6 +8,7 @@ use crate::github::CommitSha;
 use super::Priority;
 
 const PRIORITY_NAMES: [&str; 2] = ["p", "priority"];
+const ROLLUP_VALUES: [&str; 4] = ["always", "maybe", "iffy", "never"];
 
 #[derive(Debug, PartialEq)]
 pub enum CommandParseError<'a> {
@@ -47,6 +48,7 @@ impl CommandParser {
         let parsers: Vec<for<'b> fn(&'b str, &[CommandPart<'b>]) -> ParseResult<'b>> = vec![
             parse_self_approve,
             parse_unapprove,
+            parse_rollup,
             parser_help,
             parser_ping,
             parser_try_cancel,
@@ -75,10 +77,25 @@ impl CommandParser {
                                         Some(Err(CommandParseError::UnknownCommand(command)))
                                     }
                                     // For `@bors key=<value>`.
-                                    CommandPart::KeyValue { key, .. } => {
+                                    CommandPart::KeyValue { key, value } => {
                                         if key == "r" {
                                             if let Some(result) = parse_approve_on_behalf(&parts) {
                                                 return Some(result);
+                                            }
+                                        }
+
+                                        if key == "rollup" {
+                                            if ROLLUP_VALUES.contains(&value) {
+                                                return Some(Ok(BorsCommand::Rollup(
+                                                    value.to_string(),
+                                                )));
+                                            } else {
+                                                return Some(Err(
+                                                    CommandParseError::ValidationError(
+                                                        "rollup status can be never/iffy/maybe/always"
+                                                            .to_string(),
+                                                    ),
+                                                ));
                                             }
                                         }
 
@@ -133,32 +150,33 @@ fn parse_parts(input: &str) -> Result<Vec<CommandPart>, CommandParseError> {
 
 /// Parsers
 
-/// Parses "@bors r+ <p=priority>"
+/// Parses "@bors r+ <p=priority> <rollup=[never/iffy/maybe/always]>"
 fn parse_self_approve<'a>(command: &'a str, parts: &[CommandPart<'a>]) -> ParseResult<'a> {
     if command != "r+" {
         return None;
     }
 
-    match parse_priority_arg(parts) {
-        Ok(priority) => Some(Ok(BorsCommand::Approve {
+    match parse_priority_rollup_arg(parts) {
+        Ok((priority, rollup)) => Some(Ok(BorsCommand::Approve {
             approver: Approver::Myself,
             priority,
+            rollup,
         })),
         Err(e) => Some(Err(e)),
     }
 }
 
-/// Parses "@bors r=<username> <p=priority>".
+/// Parses "@bors r=<username> <p=priority> <rollup=[never/iffy/maybe/always]>".
 fn parse_approve_on_behalf<'a>(parts: &[CommandPart<'a>]) -> ParseResult<'a> {
     if let Some(CommandPart::KeyValue { value, .. }) = parts.first() {
         if value.is_empty() {
             return Some(Err(CommandParseError::MissingArgValue { arg: "r" }));
         }
-
-        match parse_priority_arg(&parts[1..]) {
-            Ok(priority) => Some(Ok(BorsCommand::Approve {
+        match parse_priority_rollup_arg(&parts[1..]) {
+            Ok((priority, rollup)) => Some(Ok(BorsCommand::Approve {
                 approver: Approver::Specified(value.to_string()),
                 priority,
+                rollup,
             })),
             Err(e) => Some(Err(e)),
         }
@@ -318,14 +336,21 @@ fn parse_priority<'a>(parts: &[CommandPart<'a>]) -> ParseResult<'a> {
     }
 }
 
-/// Parses "p=<priority>"
-fn parse_priority_arg<'a>(parts: &[CommandPart<'a>]) -> Result<Option<u32>, CommandParseError<'a>> {
+/// Parses "p=<priority> rollup=<never/iffy/maybe/always>"
+fn parse_priority_rollup_arg<'a>(
+    parts: &[CommandPart<'a>],
+) -> Result<(Option<u32>, String), CommandParseError<'a>> {
     let mut priority = None;
+    let mut rollup_status = None;
 
     for part in parts {
         match part {
             CommandPart::Bare(key) => {
-                return Err(CommandParseError::UnknownArg(key));
+                let status = parse_rollup_bare_helper(key)?;
+                if rollup_status.is_some() {
+                    return Err(CommandParseError::DuplicateArg("rollup"));
+                }
+                rollup_status = Some(status.to_string());
             }
             CommandPart::KeyValue { key, value } => {
                 if PRIORITY_NAMES.contains(key) {
@@ -335,11 +360,57 @@ fn parse_priority_arg<'a>(parts: &[CommandPart<'a>]) -> Result<Option<u32>, Comm
 
                     priority = Some(validate_priority(value)?);
                 }
+
+                if *key == "rollup" {
+                    if ROLLUP_VALUES.contains(value) {
+                        if rollup_status.is_some() {
+                            return Err(CommandParseError::DuplicateArg("rollup"));
+                        }
+
+                        rollup_status = Some(value.to_string());
+                    } else {
+                        return Err(CommandParseError::ValidationError(
+                            "rollup status can be never/iffy/maybe/always".to_string(),
+                        ));
+                    }
+                }
             }
         }
     }
 
-    Ok(priority)
+    Ok((priority, rollup_status.unwrap_or("maybe".to_string())))
+}
+
+fn parse_rollup_bare_helper<'a>(arg: &'a str) -> Result<&'a str, CommandParseError<'a>> {
+    if arg == "rollup" {
+        return Ok("always");
+    } else if arg == "rollup-" {
+        return Ok("maybe");
+    }
+    return Err(CommandParseError::UnknownArg(arg));
+}
+
+/// Parses "rollup=<never/iffy/maybe/always>"
+fn parse_rollup<'a>(command: &'a str, parts: &[CommandPart<'a>]) -> ParseResult<'a> {
+    if command != "rollup" && command != "rollup-" {
+        return None;
+    }
+
+    // Check for duplicate rollup arguments
+    if parts.iter().any(|part| match part {
+        CommandPart::Bare("rollup") | CommandPart::Bare("rollup-") => true,
+        CommandPart::KeyValue { key, .. } if *key == "rollup" => true,
+        _ => false,
+    }) {
+        return Some(Err(CommandParseError::DuplicateArg("rollup")));
+    }
+
+    let rollup_value = if command == "rollup" {
+        "always"
+    } else {
+        "maybe"
+    };
+    Some(Ok(BorsCommand::Rollup(rollup_value.to_string())))
 }
 
 #[cfg(test)]
@@ -392,13 +463,14 @@ mod tests {
     fn parse_default_approve() {
         let cmds = parse_commands("@bors r+");
         assert_eq!(cmds.len(), 1);
-        assert!(matches!(
+        assert_eq!(
             cmds[0],
             Ok(BorsCommand::Approve {
                 approver: Approver::Myself,
                 priority: None,
+                rollup: "maybe".to_string(),
             })
-        ));
+        );
     }
 
     #[test]
@@ -412,6 +484,7 @@ mod tests {
                     "user1",
                 ),
                 priority: None,
+                rollup: "maybe",
             },
         )
         "#);
@@ -428,6 +501,7 @@ mod tests {
                     "user1,user2",
                 ),
                 priority: None,
+                rollup: "maybe",
             },
         )
         "#);
@@ -441,7 +515,8 @@ mod tests {
             cmds[0],
             Ok(BorsCommand::Approve {
                 approver: Approver::Myself,
-                priority: Some(1)
+                priority: Some(1),
+                rollup: "maybe".to_string()
             })
         )
     }
@@ -454,7 +529,8 @@ mod tests {
             cmds[0],
             Ok(BorsCommand::Approve {
                 approver: Approver::Specified("user1".to_string()),
-                priority: Some(2)
+                priority: Some(2),
+                rollup: "maybe".to_string()
             })
         )
     }
@@ -472,14 +548,16 @@ mod tests {
             cmds[0],
             Ok(BorsCommand::Approve {
                 approver: Approver::Myself,
-                priority: Some(1)
+                priority: Some(1),
+                rollup: "maybe".to_string()
             })
         );
         assert_eq!(
             cmds[1],
             Ok(BorsCommand::Approve {
                 approver: Approver::Specified("user2".to_string()),
-                priority: Some(2)
+                priority: Some(2),
+                rollup: "maybe".to_string()
             })
         );
     }
@@ -532,7 +610,8 @@ mod tests {
             cmds[0],
             Ok(BorsCommand::Approve {
                 approver: Approver::Specified("user1".to_string()),
-                priority: Some(2)
+                priority: Some(2),
+                rollup: "maybe".to_string()
             })
         )
     }
@@ -651,6 +730,272 @@ mod tests {
         let cmds = parse_commands("@bors p=1 a");
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0], Ok(BorsCommand::SetPriority(1)));
+    }
+
+    #[test]
+    fn parse_approve_with_rollup() {
+        let cmds = parse_commands("@bors r+ rollup");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(
+            cmds[0],
+            Ok(BorsCommand::Approve {
+                approver: Approver::Myself,
+                priority: None,
+                rollup: "always".to_string()
+            })
+        )
+    }
+
+    #[test]
+    fn parse_approve_on_behalf_with_rollup1() {
+        let cmds = parse_commands("@bors r=user1 rollup=never");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(
+            cmds[0],
+            Ok(BorsCommand::Approve {
+                approver: Approver::Specified("user1".to_string()),
+                priority: None,
+                rollup: "never".to_string()
+            })
+        )
+    }
+
+    #[test]
+    fn parse_approve_on_behalf_with_rollup2() {
+        let cmds = parse_commands("@bors r=user1 rollup");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(
+            cmds[0],
+            Ok(BorsCommand::Approve {
+                approver: Approver::Specified("user1".to_string()),
+                priority: None,
+                rollup: "always".to_string()
+            })
+        )
+    }
+
+    #[test]
+    fn parse_approve_on_behalf_with_rollup3() {
+        let cmds = parse_commands("@bors r=user1 rollup-");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(
+            cmds[0],
+            Ok(BorsCommand::Approve {
+                approver: Approver::Specified("user1".to_string()),
+                priority: None,
+                rollup: "maybe".to_string()
+            })
+        )
+    }
+
+    #[test]
+    fn parse_multiple_rollup_commands() {
+        let cmds = parse_commands(
+            r#"
+            @bors r+ rollup
+            @bors r=user2 rollup=iffy
+        "#,
+        );
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(
+            cmds[0],
+            Ok(BorsCommand::Approve {
+                approver: Approver::Myself,
+                priority: None,
+                rollup: "always".to_string()
+            })
+        );
+        assert_eq!(
+            cmds[1],
+            Ok(BorsCommand::Approve {
+                approver: Approver::Specified("user2".to_string()),
+                priority: None,
+                rollup: "iffy".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_approve_with_invalid_rollup_status() {
+        let cmds = parse_commands("@bors r+ rollup=abc");
+        assert_eq!(cmds.len(), 1);
+        insta::assert_debug_snapshot!(cmds[0], @r#"
+        Err(
+            ValidationError(
+                "rollup status can be never/iffy/maybe/always",
+            ),
+        )
+        "#);
+    }
+
+    #[test]
+    fn parse_approve_duplicate_rollup_args1() {
+        let cmds = parse_commands("@bors r+ rollup rollup=never");
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(
+            cmds[0],
+            Err(CommandParseError::DuplicateArg("rollup"))
+        ));
+    }
+
+    #[test]
+    fn parse_approve_duplicate_rollup_args2() {
+        let cmds = parse_commands("@bors r+ rollup rollup-");
+        assert_eq!(cmds.len(), 1);
+        println!("{:?}", cmds[0]);
+        assert!(matches!(
+            cmds[0],
+            Err(CommandParseError::DuplicateArg("rollup"))
+        ));
+    }
+
+    #[test]
+    fn parse_approve_duplicate_rollup_args3() {
+        let cmds = parse_commands("@bors r+ rollup=iffy rollup=never");
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(
+            cmds[0],
+            Err(CommandParseError::DuplicateArg("rollup"))
+        ));
+    }
+
+    #[test]
+    fn parse_approve_rollup_empty() {
+        let cmds = parse_commands("@bors r+ rollup=");
+        assert_eq!(cmds.len(), 1);
+        insta::assert_debug_snapshot!(cmds[0], @r###"
+        Err(
+            MissingArgValue {
+                arg: "rollup",
+            },
+        )
+        "###);
+    }
+
+    #[test]
+    fn parse_rollup_bare1() {
+        let cmds = parse_commands("@bors rollup");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0], Ok(BorsCommand::Rollup("always".to_string())));
+    }
+
+    #[test]
+    fn parse_rollup_bare2() {
+        let cmds = parse_commands("@bors rollup-");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0], Ok(BorsCommand::Rollup("maybe".to_string())));
+    }
+
+    #[test]
+    fn parse_priority_rollup() {
+        let cmds = parse_commands("@bors rollup=always");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0], Ok(BorsCommand::Rollup("always".to_string())));
+    }
+
+    #[test]
+    fn parse_rollup_empty() {
+        let cmds = parse_commands("@bors rollup=");
+        assert_eq!(cmds.len(), 1);
+        insta::assert_debug_snapshot!(cmds[0], @r###"
+        Err(
+            MissingArgValue {
+                arg: "rollup",
+            },
+        )
+        "###);
+    }
+
+    #[test]
+    fn parse_rollup_invalid() {
+        let cmds = parse_commands("@bors rollup=3");
+        assert_eq!(cmds.len(), 1);
+        insta::assert_debug_snapshot!(cmds[0], @r#"
+        Err(
+            ValidationError(
+                "rollup status can be never/iffy/maybe/always",
+            ),
+        )
+        "#);
+    }
+
+    #[test]
+    fn parse_duplicate_rollup1() {
+        let cmds = parse_commands("@bors rollup rollup-");
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(
+            cmds[0],
+            Err(CommandParseError::DuplicateArg("rollup"))
+        ));
+    }
+
+    #[test]
+    fn parse_duplicate_rollup2() {
+        let cmds = parse_commands("@bors rollup rollup=maybe");
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(
+            cmds[0],
+            Err(CommandParseError::DuplicateArg("rollup"))
+        ));
+    }
+
+    #[test]
+    fn parse_duplicate_rollup3() {
+        let cmds = parse_commands("@bors rollup=always rollup=never");
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(
+            cmds[0],
+            Err(CommandParseError::DuplicateArg("rollup"))
+        ));
+    }
+
+    #[test]
+    fn parse_rollup_unknown_arg() {
+        let cmds = parse_commands("@bors rollup a");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0], Ok(BorsCommand::Rollup("always".to_string())));
+    }
+
+    #[test]
+    fn parse_approve_with_rollup_priority1() {
+        let cmds = parse_commands("@bors r+ rollup p=1");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(
+            cmds[0],
+            Ok(BorsCommand::Approve {
+                approver: Approver::Myself,
+                priority: Some(1),
+                rollup: "always".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_approve_with_rollup_priority2() {
+        let cmds = parse_commands("@bors r+ rollup priority=1");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(
+            cmds[0],
+            Ok(BorsCommand::Approve {
+                approver: Approver::Myself,
+                priority: Some(1),
+                rollup: "always".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_approve_with_rollup_priority3() {
+        let cmds = parse_commands("@bors r+ rollup=iffy p=1");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(
+            cmds[0],
+            Ok(BorsCommand::Approve {
+                approver: Approver::Myself,
+                priority: Some(1),
+                rollup: "iffy".to_string()
+            })
+        );
     }
 
     #[test]

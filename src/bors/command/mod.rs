@@ -31,6 +31,8 @@ pub enum BorsCommand {
         approver: Approver,
         /// Priority of the commit.
         priority: Option<Priority>,
+        // Rollup status of the commit.
+        rollup: String,
     },
     /// Unapprove a commit.
     Unapprove,
@@ -53,4 +55,6 @@ pub enum BorsCommand {
     Delegate,
     /// Revoke any previously granted delegation.
     Undelegate,
+    /// Rollup status.
+    Rollup(String),
 }

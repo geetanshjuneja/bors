@@ -25,6 +25,7 @@ pub(super) async fn command_approve(
     author: &GithubUser,
     approver: &Approver,
     priority: Option<u32>,
+    rollup: String,
 ) -> anyhow::Result<()> {
     tracing::info!("Approving PR {}", pr.number);
     if !has_permission(&repo_state, author, pr, &db, PermissionType::Review).await? {
@@ -40,6 +41,7 @@ pub(super) async fn command_approve(
         pr.number,
         approver.as_str(),
         priority,
+        rollup.as_str(),
     )
     .await?;
     handle_label_trigger(&repo_state, pr.number, LabelTrigger::Approved).await?;
@@ -112,6 +114,23 @@ pub(super) async fn command_undelegate(
         return Ok(());
     }
     db.undelegate(repo_state.repository(), pr.number).await
+}
+
+/// Set the rollup of a pull request.
+/// rollup can only be set by a user of sufficient authority.
+pub(super) async fn command_set_rollup(
+    repo_state: Arc<RepositoryState>,
+    db: Arc<PgDbClient>,
+    pr: &PullRequest,
+    author: &GithubUser,
+    rollup: &str,
+) -> anyhow::Result<()> {
+    if !has_permission(&repo_state, author, pr, &db, PermissionType::Review).await? {
+        deny_request(&repo_state, pr, author, PermissionType::Review).await?;
+        return Ok(());
+    }
+    db.set_rollup(repo_state.repository(), pr.number, rollup)
+        .await
 }
 
 pub(super) async fn handle_pull_request_edited(
